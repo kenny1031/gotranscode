@@ -8,6 +8,8 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strconv"
+	"sync"
 	"syscall"
 	"time"
 
@@ -35,23 +37,37 @@ func main() {
 		log.Fatal("DATABASE_URL is not set")
 	}
 
-	pool, err := pgxpool.New(context.Background(), dbURL)
+	// Configure the number of concurrent workers.
+	workerCount := 2
+
+	if raw := os.Getenv("WORKER_CONCURRENCY"); raw != "" {
+		n, err := strconv.Atoi(raw)
+		if err != nil || n < 1 || n > 8 {
+			log.Fatal("WORKER_CONCURRENCY must be between 1 and 8")
+		}
+		workerCount = n
+	}
+
+	// Initialise PostgreSQL connection pool.
+	startupCtx, cancel := context.WithTimeout(
+		context.Background(),
+		databaseTimeout,
+	)
+
+	pool, err := pgxpool.New(startupCtx, dbURL)
 	if err != nil {
+		cancel()
 		log.Fatalf("create database pool: %v", err)
 	}
 	defer pool.Close()
 
-	ctx, cancel := context.WithTimeout(
-		context.Background(),
-		databaseTimeout,
-	)
-	if err := pool.Ping(ctx); err != nil {
+	if err := pool.Ping(startupCtx); err != nil {
 		cancel()
 		log.Fatalf("connect to PostgreSQL: %v", err)
 	}
 	cancel()
 
-	// Stop polling when SIGINT or SIGTERM is received.
+	// Shutdown signal stops new job claims.
 	stopCtx, stop := signal.NotifyContext(
 		context.Background(),
 		os.Interrupt,
@@ -59,28 +75,84 @@ func main() {
 	)
 	defer stop()
 
-	log.Println("GoTranscode worker started")
+	var wg sync.WaitGroup
 
+	log.Printf(
+		"starting worker pool: concurrency=%d",
+		workerCount,
+	)
+
+	// Launch a fixed number of worker goroutines.
+	for i := 1; i <= workerCount; i++ {
+		wg.Add(1)
+
+		go func(workerID int) {
+			defer wg.Done()
+			workerLoop(stopCtx, pool, workerID)
+		}(i)
+	}
+
+	// Wait until SIGINT or SIGTERM.
+	<-stopCtx.Done()
+
+	log.Println("shutdown requested: stopping new claims")
+
+	// Restore default signal behavior for subsequent signals.
+	stop()
+
+	// Wait for all workers to finish their current jobs.
+	wg.Wait()
+
+	log.Println("all workers stopped")
+}
+
+// workerLoop repeatedly claims and processes jobs.
+func workerLoop(
+	ctx context.Context,
+	pool *pgxpool.Pool,
+	workerID int,
+) {
 	ticker := time.NewTicker(pollInterval)
 	defer ticker.Stop()
 
+	log.Printf("[worker-%d] started", workerID)
+
 	for {
-		if stopCtx.Err() != nil {
-			log.Println("worker stopped")
-			return
+		// Stop before attempting another claim.
+		if ctx.Err() != nil {
+			break
 		}
 
-		if err := processOne(pool); err != nil {
-			log.Printf("worker error: %v", err)
+		processed, err := processOne(ctx, pool, workerID)
+
+		if err != nil {
+			if ctx.Err() != nil {
+				break
+			}
+
+			log.Printf(
+				"[worker-%d] error: %v",
+				workerID,
+				err,
+			)
 		}
 
+		// If a job was processed, check for more immediately.
+		if processed {
+			continue
+		}
+
+		// No job available: wait or exit on shutdown.
 		select {
-		case <-stopCtx.Done():
-			log.Println("worker stopped")
+		case <-ctx.Done():
+			log.Printf("[worker-%d] stopped", workerID)
 			return
+
 		case <-ticker.C:
 		}
 	}
+
+	log.Printf("[worker-%d] stopped", workerID)
 }
 
 // claimNextJob atomically claims one queued job.
@@ -127,42 +199,46 @@ func claimNextJob(
 		return Job{}, false, nil
 	}
 	if err != nil {
-		return Job{}, false, fmt.Errorf(
-			"claim job: %w", err,
-		)
+		return Job{}, false, fmt.Errorf("claim job: %w", err)
 	}
 
 	return job, true, nil
 }
 
-// processOne claims and processes at most one job.
-func processOne(pool *pgxpool.Pool) error {
-	ctx, cancel := context.WithTimeout(
-		context.Background(),
+// processOne claims and executes at most one job.
+func processOne(
+	stopCtx context.Context,
+	pool *pgxpool.Pool,
+	workerID int,
+) (bool, error) {
+	claimCtx, cancel := context.WithTimeout(
+		stopCtx,
 		databaseTimeout,
 	)
 
-	job, found, err := claimNextJob(ctx, pool)
+	job, found, err := claimNextJob(claimCtx, pool)
 	cancel()
 
 	if err != nil {
-		return err
+		return false, err
 	}
+
 	if !found {
-		return nil
+		return false, nil
 	}
 
 	log.Printf(
-		"claimed job %s (profile=%s, attempt=%d)",
+		"[worker-%d] claimed job %s (attempt=%d)",
+		workerID,
 		job.ID,
-		job.Profile,
 		job.Attempts,
 	)
 
-	// Execute FFmpeg outside the database transaction.
+	// Execution is deliberately independent of shutdown context:
+	// an already-claimed job can finish before the worker exits.
 	outputPath, runErr := executeJob(job)
 
-	// Persist the execution result.
+	// Save the result even if shutdown has been requested.
 	updateCtx, updateCancel := context.WithTimeout(
 		context.Background(),
 		databaseTimeout,
@@ -177,15 +253,20 @@ func processOne(pool *pgxpool.Pool) error {
 			runErr.Error(),
 		)
 		if err != nil {
-			return fmt.Errorf(
-				"job %s failed; could not save failure: %w",
+			return true, fmt.Errorf(
+				"job %s failed, but DB update failed: %w",
 				job.ID,
 				err,
 			)
 		}
 
-		log.Printf("job %s failed: %v", job.ID, runErr)
-		return nil
+		log.Printf(
+			"[worker-%d] job %s failed: %v",
+			workerID,
+			job.ID,
+			runErr,
+		)
+		return true, nil
 	}
 
 	if err := markCompleted(
@@ -194,26 +275,28 @@ func processOne(pool *pgxpool.Pool) error {
 		job.ID,
 		outputPath,
 	); err != nil {
-		return fmt.Errorf(
-			"job %s completed but DB update failed: %w",
+		return true, fmt.Errorf(
+			"job %s finished, but DB update failed: %w",
 			job.ID,
 			err,
 		)
 	}
 
 	log.Printf(
-		"job %s completed: %s",
+		"[worker-%d] completed job %s: %s",
+		workerID,
 		job.ID,
 		outputPath,
 	)
-	return nil
+
+	return true, nil
 }
 
-// executeJob invokes the reusable FFmpeg executor.
+// executeJob starts FFmpeg and publishes the output.
 func executeJob(job Job) (string, error) {
-	// MVP restriction: only direct files inside input/.
 	inputPath := filepath.Clean(job.InputPath)
 
+	// Restrict input to a direct file inside input/.
 	if filepath.IsAbs(inputPath) ||
 		filepath.Dir(inputPath) != "input" {
 		return "", errors.New(
@@ -221,65 +304,58 @@ func executeJob(job Job) (string, error) {
 		)
 	}
 
-	// Reject directories and symbolic links.
 	info, err := os.Lstat(inputPath)
 	if err != nil {
 		return "", fmt.Errorf("input file: %w", err)
 	}
 	if !info.Mode().IsRegular() {
-		return "", errors.New(
-			"input must be a regular file",
-		)
+		return "", errors.New("input must be a regular file")
 	}
-
-	// Use a unique output name for each job.
-	finalPath := filepath.Join(
-		"output",
-		job.ID+".mp4",
-	)
-	tempPath := filepath.Join(
-		"output",
-		job.ID+".partial.mp4",
-	)
 
 	if err := os.MkdirAll("output", 0755); err != nil {
 		return "", fmt.Errorf("create output directory: %w", err)
 	}
 
-	// Do not overwrite an existing final result.
+	finalPath := filepath.Join("output", job.ID+".mp4")
+	tempPath := filepath.Join(
+		"output",
+		job.ID+".partial.mp4",
+	)
+
+	// Never intentionally overwrite an existing final result.
 	if _, err := os.Stat(finalPath); err == nil {
 		return "", fmt.Errorf(
-			"final output already exists: %s", finalPath,
+			"final output already exists: %s",
+			finalPath,
 		)
 	} else if !errors.Is(err, os.ErrNotExist) {
-		return "", fmt.Errorf("check final output: %w", err)
+		return "", fmt.Errorf("check output: %w", err)
 	}
 
-	// Remove a leftover partial output from an earlier crash.
+	// Remove an incomplete file from a previous attempt.
 	if err := os.Remove(tempPath); err != nil &&
 		!errors.Is(err, os.ErrNotExist) {
-		return "", fmt.Errorf("remove partial output: %w", err)
+		return "", fmt.Errorf("remove partial file: %w", err)
 	}
-
 	defer os.Remove(tempPath)
 
-	ctx, cancel := context.WithTimeout(
+	jobCtx, cancel := context.WithTimeout(
 		context.Background(),
 		jobTimeout,
 	)
 	defer cancel()
 
 	_, err = transcode.Run(
-		ctx,
+		jobCtx,
 		inputPath,
 		tempPath,
 		transcode.Profile(job.Profile),
 	)
 	if err != nil {
-		return "", fmt.Errorf("transcode job: %w", err)
+		return "", fmt.Errorf("FFmpeg transcoding: %w", err)
 	}
 
-	// Publish the completed output.
+	// Both paths are on the same filesystem.
 	if err := os.Rename(tempPath, finalPath); err != nil {
 		return "", fmt.Errorf("publish output: %w", err)
 	}
@@ -287,7 +363,7 @@ func executeJob(job Job) (string, error) {
 	return finalPath, nil
 }
 
-// markCompleted records a successful execution.
+// markCompleted persists a successful execution.
 func markCompleted(
 	ctx context.Context,
 	pool *pgxpool.Pool,
@@ -314,7 +390,7 @@ func markCompleted(
 	return nil
 }
 
-// markFailed records a failed execution.
+// markFailed persists a failed execution.
 func markFailed(
 	ctx context.Context,
 	pool *pgxpool.Pool,
